@@ -118,3 +118,13 @@ app.listen(PORT, () => {
     console.log(`Advanced WP Proxy on port ${PORT}`);
     console.log(`${PROXY_DOMAIN} → ${TARGET}`);
 });
+
+// Пинг самого себя каждые 14 минут
+const SELF_URL = process.env.RENDER_EXTERNAL_URL;
+if (SELF_URL) {
+    setInterval(() => {
+        fetch(SELF_URL + '/health').catch(() => {});
+    }, 14 * 60 * 1000);
+}
+
+app.get('/health', (req, res) => res.send('ok'));

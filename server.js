@@ -115,3 +115,13 @@ app.listen(PORT, () => {
     console.log(`WP Proxy running on port ${PORT}`);
     console.log(`Proxying to: ${TARGET}`);
 });
+
+// Пинг самого себя каждые 14 минут
+const SELF_URL = process.env.RENDER_EXTERNAL_URL;
+if (SELF_URL) {
+    setInterval(() => {
+        fetch(SELF_URL + '/health').catch(() => {});
+    }, 14 * 60 * 1000);
+}
+
+app.get('/health', (req, res) => res.send('ok'));

@@ -1,8 +1,8 @@
 {
-  "name": "wp-proxy",
+  "name": "render-rproxy",
   "version": "1.0.0",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server_multy_v2.js"
   },
   "dependencies": {
     "express": "^4.18.2",
