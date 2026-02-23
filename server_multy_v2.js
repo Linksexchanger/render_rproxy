@@ -1,3 +1,4 @@
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 const express = require('express');
 const compression = require('compression');
 
@@ -63,6 +64,12 @@ async function loadConfig() {
         if (!configLoaded) {
             console.error('No config available, will retry...');
         }
+
+	console.error(`[${req.hostname}] Proxy error:`, e.message);
+    	console.error(`  Cause:`, e.cause?.message || 'unknown');
+    	console.error(`  Code:`, e.cause?.code || 'unknown');
+    	console.error(`  Target: ${target?.origin}${req.originalUrl}`);
+    	res.status(502).send(`Origin unavailable: ${e.cause?.code || e.message}`);
     }
 }
 
@@ -188,6 +195,12 @@ app.get(
         } catch (e) {
             console.error(`[${req.hostname}] Static error:`, e.message);
             res.status(502).send('Origin error');
+
+	    console.error(`[${req.hostname}] Proxy error:`, e.message);
+    	    console.error(`  Cause:`, e.cause?.message || 'unknown');
+    	    console.error(`  Code:`, e.cause?.code || 'unknown');
+    	    console.error(`  Target: ${target?.origin}${req.originalUrl}`);
+    	    res.status(502).send(`Origin unavailable: ${e.cause?.code || e.message}`);
         }
     }
 );
@@ -278,6 +291,13 @@ app.use(async (req, res) => {
     } catch (e) {
         console.error(`[${req.hostname}] Proxy error:`, e.message);
         res.status(502).send('Origin unavailable');
+
+	console.error(`[${req.hostname}] Proxy error:`, e.message);
+    	console.error(`  Cause:`, e.cause?.message || 'unknown');
+    	console.error(`  Code:`, e.cause?.code || 'unknown');
+    	console.error(`  Target: ${target?.origin}${req.originalUrl}`);
+    	res.status(502).send(`Origin unavailable: ${e.cause?.code || e.message}`);
+
     }
 });
 
