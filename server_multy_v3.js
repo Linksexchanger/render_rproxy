@@ -239,15 +239,6 @@ app.use(async (req, res) => {
 
         const resp = await fetchOrigin(target, req.originalUrl, fetchOpts);
 
-        // Редиректы
-        if ([301, 302, 303, 307, 308].includes(resp.status)) {
-            let location = resp.headers.get('location') || '';
-            location = location
-                .replace(target.origin, `https://${req.hostname}`)
-                .replace(`//${target.host}`, `//${req.hostname}`);
-            return res.redirect(resp.status, location);
-        }
-
         const contentType = resp.headers.get('content-type') || '';
         res.status(resp.status);
         res.set('Content-Type', contentType);
@@ -261,6 +252,15 @@ app.use(async (req, res) => {
             );
         });
 
+        // Редиректы
+        if ([301, 302, 303, 307, 308].includes(resp.status)) {
+            let location = resp.headers.get('location') || '';
+            location = location
+                .replace(target.origin, `https://${req.hostname}`)
+                .replace(`//${target.host}`, `//${req.hostname}`);
+            return res.redirect(resp.status, location);
+        }
+
         // HTML — подмена URL
         if (contentType.includes('text/html')) {
             let html = await resp.text();
@@ -270,6 +270,11 @@ app.use(async (req, res) => {
             res.send(html);
         } else {
             res.send(Buffer.from(await resp.arrayBuffer()));
+        }
+
+        console.log(`[${req.hostname}] ${req.method} ${req.originalUrl} -> status ${resp.status}`);
+        if (cookies.length) {
+            console.log(`[${req.hostname}] Set-Cookie:`, cookies);
         }
 
     } catch (e) {
