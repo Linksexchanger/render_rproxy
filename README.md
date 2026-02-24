@@ -196,7 +196,7 @@ All admin endpoints require `?token=ADMIN_TOKEN` query parameter.
 ## Architecture
 
 ```
-User (Russia)          Render.com              Origin Server
+User               Render.com              Origin Server
 ┌──────────┐       ┌──────────────┐        ┌──────────────┐
 │ Browser  │──────▶│ Shield Proxy │───────▶│ nginx / WP   │
 │          │◀──────│              │◀───────│              │
