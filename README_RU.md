@@ -12,6 +12,7 @@
 - **Защита от ботов** — блокировка по User-Agent (настраивается для каждого домена)
 - **Ограничение частоты** — лимит запросов на IP, настраивается для каждого домена
 - **WAF** — блокировка SQL-инъекций, XSS, обхода путей, shell-инъекций
+- **IP Intelligence** — обнаружение VPN/Tor/Proxy через [ipquery.io](https://ipquery.io) ([GitHub](https://github.com/ipqwery))
 - **JS-проверка** — автоматическая проверка браузера (как у Cloudflare, 3 сек)
 - **Математическая CAPTCHA** — задача на сложение
 - **hCaptcha** — опциональная интеграция
@@ -67,7 +68,18 @@ npm install
         "challenge": { "mode": "off", "type": "js", "duration_h": 24 },
         "hcaptcha_sitekey": "",
         "hcaptcha_secret": "",
-        "security_headers": true
+        "security_headers": true,
+        "ip_intel": {
+          "enabled": true,
+          "block_vpn": false,
+          "block_tor": true,
+          "block_proxy": true,
+          "challenge_vpn": true,
+          "challenge_tor": false,
+          "challenge_proxy": false,
+          "block_risk_above": 0.85,
+          "challenge_risk_above": 0.5
+        }
       }
     },
     {
@@ -77,7 +89,14 @@ npm install
       "security": {
         "allowed_ips": ["ВАШ_IP"],
         "rate_limit": { "window_s": 60, "max": 30 },
-        "challenge": { "mode": "all", "type": "math", "duration_h": 1 }
+        "challenge": { "mode": "all", "type": "math", "duration_h": 1 },
+        "ip_intel": {
+          "enabled": true,
+          "block_vpn": true,
+          "block_tor": true,
+          "block_proxy": true,
+          "block_risk_above": 0.7
+        }
       }
     }
   ],
@@ -94,7 +113,18 @@ npm install
     "challenge": { "mode": "off", "type": "js", "duration_h": 24 },
     "hcaptcha_sitekey": "",
     "hcaptcha_secret": "",
-    "security_headers": true
+    "security_headers": true,
+    "ip_intel": {
+      "enabled": false,
+      "block_vpn": false,
+      "block_tor": true,
+      "block_proxy": true,
+      "challenge_vpn": true,
+      "challenge_tor": false,
+      "challenge_proxy": false,
+      "block_risk_above": 0.85,
+      "challenge_risk_above": 0.5
+    }
   }
 }
 ```
@@ -127,6 +157,7 @@ npm install
 | `hcaptcha_sitekey` | `string` | `""` | Ключ сайта hCaptcha |
 | `hcaptcha_secret` | `string` | `""` | Секретный ключ hCaptcha |
 | `security_headers` | `boolean` | `true` | Добавлять заголовки безопасности |
+| `ip_intel` | `object` | см. ниже | Настройки IP Intelligence |
 
 ### Режимы проверки (challenge)
 
@@ -144,6 +175,84 @@ npm install
 | `math` | Пользователь решает пример (например 7 + 3 = ?) |
 | `hcaptcha` | Виджет hCaptcha (нужны ключи) |
 
+## IP Intelligence
+
+Работает на основе [ipquery.io](https://ipquery.io) — бесплатный API для анализа IP-адресов ([GitHub](https://github.com/ipqwery)).
+
+Обнаруживает и блокирует или проверяет посетителей, подключающихся через VPN, Tor, публичные прокси и IP дата-центров на основе скоринга рисков.
+
+### Настройки IP Intel
+
+Настраиваются для каждого домена в `security.ip_intel`:
+
+| Параметр | Тип | По умолчанию | Описание |
+|----------|-----|--------------|----------|
+| `enabled` | `boolean` | `false` | Включить проверку IP |
+| `block_vpn` | `boolean` | `false` | Блокировать VPN-соединения |
+| `block_tor` | `boolean` | `true` | Блокировать выходные узлы Tor |
+| `block_proxy` | `boolean` | `true` | Блокировать известные прокси |
+| `challenge_vpn` | `boolean` | `true` | Показывать проверку пользователям VPN |
+| `challenge_tor` | `boolean` | `false` | Показывать проверку пользователям Tor (если не заблокированы) |
+| `challenge_proxy` | `boolean` | `false` | Показывать проверку пользователям прокси (если не заблокированы) |
+| `block_risk_above` | `number` | `0.85` | Блокировать IP с оценкой риска выше (0.0–1.0) |
+| `challenge_risk_above` | `number` | `0.5` | Показывать проверку при оценке риска выше |
+
+### Как это работает
+
+```
+Новый посетитель → Запрос к ipquery.io → Кэш на 6 часов
+                        │
+                        ├── Tor + block_tor=true          → 403 Заблокирован
+                        ├── VPN + block_vpn=true           → 403 Заблокирован
+                        ├── Proxy + block_proxy=true       → 403 Заблокирован
+                        ├── Риск > block_risk_above        → 403 Заблокирован
+                        │
+                        ├── VPN + challenge_vpn=true       → Страница проверки
+                        ├── Риск > challenge_risk_above    → Страница проверки
+                        │
+                        └── Чистый IP                      → Пропустить
+```
+
+### Производительность и лимиты
+
+- Результаты кэшируются 6 часов (макс. 3000 записей, ~300КБ)
+- Макс. 5 параллельных запросов к API (предотвращает перегрузку)
+- Таймаут 3 секунды (при недоступности API — пропускает)
+- Статические файлы (JS, CSS, изображения) не проверяются
+- Прошедшие проверку посетители не проверяются повторно
+
+### Примеры конфигурации
+
+**Публичный WordPress-сайт** — проверять VPN, блокировать Tor:
+```json
+"ip_intel": {
+  "enabled": true,
+  "block_tor": true,
+  "challenge_vpn": true,
+  "block_risk_above": 0.85
+}
+```
+
+**Админ-панель** — блокировать все анонимайзеры:
+```json
+"ip_intel": {
+  "enabled": true,
+  "block_vpn": true,
+  "block_tor": true,
+  "block_proxy": true,
+  "block_risk_above": 0.7
+}
+```
+
+**Мягкий режим** — блокировать только высокий риск:
+```json
+"ip_intel": {
+  "enabled": true,
+  "block_risk_above": 0.9,
+  "challenge_risk_above": 0.6
+}
+```
+
 ## API управления
 
 Все административные endpoint требуют параметр `?token=ADMIN_TOKEN`.
@@ -156,6 +265,7 @@ npm install
 | `/attack?token=X&on=false` | GET | Выключить режим «Под атакой» для всех доменов |
 | `/attack?token=X&domain=D&on=true` | GET | Включить режим «Под атакой» для конкретного домена |
 | `/attack?token=X&domain=D&on=false` | GET | Выключить режим «Под атакой» для конкретного домена |
+| `/ip-check?token=X&ip=1.2.3.4` | GET | Проверить данные IP Intelligence |
 
 ### Пример ответа /health
 
@@ -168,7 +278,11 @@ npm install
     "blocked": 47,
     "challenged": 12,
     "cached": 890,
-    "waf": 3
+    "waf": 3,
+    "intel_hits": 340,
+    "intel_misses": 28,
+    "intel_blocks": 5,
+    "intel_challenges": 8
   },
   "sites": [
     {
@@ -176,36 +290,51 @@ npm install
       "challenge": "off",
       "waf": true,
       "rateLimit": 60,
-      "attack": false
-    },
-    {
-      "domain": "admin.example.com",
-      "challenge": "all",
-      "waf": true,
-      "rateLimit": 30,
+      "ipIntel": true,
       "attack": false
     }
   ],
   "cache": 42,
   "cacheMB": "3.2",
   "rateSessions": 15,
-  "memMB": 67.3
+  "intelCache": 156,
+  "intelActive": 1,
+  "memMB": 72.4
+}
+```
+
+### Пример ответа /ip-check
+
+```json
+{
+  "ip": "1.2.3.4",
+  "info": {
+    "vpn": true,
+    "tor": false,
+    "proxy": false,
+    "datacenter": true,
+    "risk": 0.72,
+    "country": "NL",
+    "isp": "DataCamp Limited",
+    "ts": 1708678800000
+  }
 }
 ```
 
 ## Архитектура
 
 ```
-Пользователь (РФ)      Render.com              Сервер-источник
-┌──────────┐        ┌──────────────┐        ┌──────────────┐
-│ Браузер  │───────▶│ Shield Proxy │───────▶│ nginx / WP   │
-│          │◀───────│              │◀───────│              │
-└──────────┘        │ ✓ WAF        │        └──────────────┘
-                    │ ✓ Rate Limit │
-                    │ ✓ Блок ботов │
-                    │ ✓ Challenge  │
-                    │ ✓ Кэш       │
-                    └──────────────┘
+Пользователь           Render.com                    Сервер-источник
+┌──────────┐        ┌─────────────────┐            ┌──────────────┐
+│ Браузер  │──────▶│  Shield Proxy   │──────────▶│ nginx / WP   │
+│          │◀──────│                 │◀──────────│              │
+└──────────┘        │ ✓ WAF           │            └──────────────┘
+                    │ ✓ Rate Limit    │
+                    │ ✓ Блок ботов    │            ┌──────────────┐
+                    │ ✓ IP Intel ─────┼──────────▶│ ipquery.io   │
+                    │ ✓ Challenge     │◀──────────│ (проверка IP)│
+                    │ ✓ Кэш           │            └──────────────┘
+                    └─────────────────┘
 ```
 
 ## Потребление памяти
@@ -217,7 +346,8 @@ npm install
 | Кэш статики | 15МБ суммарно, 50КБ на элемент |
 | Большие файлы | Потоковая передача (>512КБ) без буферизации |
 | Таблица rate-limit | Очищается каждые 30 сек, макс. 5000 записей |
-| Типичное потребление | 60–120МБ |
+| Кэш IP Intel | Макс. 3000 записей (~300КБ), TTL 6 часов |
+| Типичное потребление | 60–130МБ |
 
 ## Правила WAF
 
@@ -232,10 +362,18 @@ npm install
 
 - **Добавление сайта:** отредактируйте `sites.json` на сервере, подождите 5 мин или вызовите `/reload`
 - **Экстренная ситуация:** вызовите `/attack?on=true` для мгновенной проверки всех посетителей
-- **PMA / админ-панели:** используйте `"challenge": {"mode": "all", "type": "math"}` и ограничьте `allowed_ips`
+- **PMA / админ-панели:** используйте `"challenge": {"mode": "all", "type": "math"}` с IP Intel блокировкой и ограничением `allowed_ips`
 - **Keep-alive:** прокси пингует себя каждые 14 мин для предотвращения засыпания Render
 - **Несколько сайтов:** один сервис Render обслуживает все домены, укладывается в 750 бесплатных часов/месяц
+- **IP Intelligence:** включайте только для доменов, которым это необходимо, чтобы минимизировать обращения к API
+
+## Сторонние сервисы
+
+| Сервис | Использование | Лицензия / Условия |
+|--------|---------------|---------------------|
+| [ipquery.io](https://ipquery.io) ([GitHub](https://github.com/ipqwery)) | IP Intelligence — обнаружение VPN, Tor, прокси, оценка рисков | Бесплатный API, условия на [ipquery.io](https://ipquery.io) |
+| [hCaptcha](https://www.hcaptcha.com) | Опциональная CAPTCHA-проверка | Бесплатный тариф, условия на [hcaptcha.com](https://www.hcaptcha.com/terms) |
 
 ## Лицензия
 
-MIT
+MIT — см. [LICENSE](LICENSE)

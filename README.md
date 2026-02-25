@@ -12,6 +12,7 @@ Lightweight Cloudflare-like reverse proxy for [Render.com](https://render.com) f
 - **Bot Protection** — blocks known bad bots by User-Agent (configurable per domain)
 - **Rate Limiting** — per-IP request limits, configurable per domain
 - **WAF** — blocks SQL injection, XSS, path traversal, shell injection
+- **IP Intelligence** — VPN/Tor/Proxy detection via [ipquery.io](https://ipquery.io) ([GitHub](https://github.com/ipqwery))
 - **JS Challenge** — automatic browser verification (Cloudflare-style, 3 sec)
 - **Math CAPTCHA** — human-readable math challenge
 - **hCaptcha** — optional hCaptcha integration
@@ -67,7 +68,18 @@ Host `sites.json` on your origin server. The proxy fetches it every 5 minutes.
         "challenge": { "mode": "off", "type": "js", "duration_h": 24 },
         "hcaptcha_sitekey": "",
         "hcaptcha_secret": "",
-        "security_headers": true
+        "security_headers": true,
+        "ip_intel": {
+          "enabled": true,
+          "block_vpn": false,
+          "block_tor": true,
+          "block_proxy": true,
+          "challenge_vpn": true,
+          "challenge_tor": false,
+          "challenge_proxy": false,
+          "block_risk_above": 0.85,
+          "challenge_risk_above": 0.5
+        }
       }
     },
     {
@@ -77,7 +89,14 @@ Host `sites.json` on your origin server. The proxy fetches it every 5 minutes.
       "security": {
         "allowed_ips": ["YOUR_IP"],
         "rate_limit": { "window_s": 60, "max": 30 },
-        "challenge": { "mode": "all", "type": "math", "duration_h": 1 }
+        "challenge": { "mode": "all", "type": "math", "duration_h": 1 },
+        "ip_intel": {
+          "enabled": true,
+          "block_vpn": true,
+          "block_tor": true,
+          "block_proxy": true,
+          "block_risk_above": 0.7
+        }
       }
     }
   ],
@@ -94,7 +113,18 @@ Host `sites.json` on your origin server. The proxy fetches it every 5 minutes.
     "challenge": { "mode": "off", "type": "js", "duration_h": 24 },
     "hcaptcha_sitekey": "",
     "hcaptcha_secret": "",
-    "security_headers": true
+    "security_headers": true,
+    "ip_intel": {
+      "enabled": false,
+      "block_vpn": false,
+      "block_tor": true,
+      "block_proxy": true,
+      "challenge_vpn": true,
+      "challenge_tor": false,
+      "challenge_proxy": false,
+      "block_risk_above": 0.85,
+      "challenge_risk_above": 0.5
+    }
   }
 }
 ```
@@ -127,6 +157,7 @@ Each setting can be specified per domain in `sites[].security` or globally in `s
 | `hcaptcha_sitekey` | `string` | `""` | hCaptcha site key |
 | `hcaptcha_secret` | `string` | `""` | hCaptcha secret key |
 | `security_headers` | `boolean` | `true` | Add security response headers |
+| `ip_intel` | `object` | see below | IP Intelligence settings |
 
 ### Challenge Modes
 
@@ -144,18 +175,97 @@ Each setting can be specified per domain in `sites[].security` or globally in `s
 | `math` | User solves a simple math problem (e.g. 7 + 3 = ?) |
 | `hcaptcha` | hCaptcha widget (requires sitekey and secret) |
 
+## IP Intelligence
+
+Powered by [ipquery.io](https://ipquery.io) — free IP address intelligence API ([GitHub](https://github.com/ipqwery)).
+
+Detects and blocks or challenges visitors connecting through VPNs, Tor exit nodes, public proxies, and datacenter IPs based on risk scoring.
+
+### IP Intel Settings
+
+Configurable per domain in `security.ip_intel`:
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `enabled` | `boolean` | `false` | Enable IP intelligence checks |
+| `block_vpn` | `boolean` | `false` | Block VPN connections |
+| `block_tor` | `boolean` | `true` | Block Tor exit nodes |
+| `block_proxy` | `boolean` | `true` | Block known proxy IPs |
+| `challenge_vpn` | `boolean` | `true` | Show challenge to VPN users |
+| `challenge_tor` | `boolean` | `false` | Show challenge to Tor users (if not blocked) |
+| `challenge_proxy` | `boolean` | `false` | Show challenge to proxy users (if not blocked) |
+| `block_risk_above` | `number` | `0.85` | Block IPs with risk score above this value (0.0–1.0) |
+| `challenge_risk_above` | `number` | `0.5` | Challenge IPs with risk score above this value |
+
+### How It Works
+
+```
+New visitor → IP lookup (ipquery.io) → cached for 6 hours
+                  │
+                  ├── Tor detected + block_tor=true      → 403 Blocked
+                  ├── VPN detected + block_vpn=true       → 403 Blocked
+                  ├── Proxy detected + block_proxy=true   → 403 Blocked
+                  ├── Risk > block_risk_above             → 403 Blocked
+                  │
+                  ├── VPN detected + challenge_vpn=true   → Challenge page
+                  ├── Risk > challenge_risk_above         → Challenge page
+                  │
+                  └── Clean IP                            → Pass through
+```
+
+### Performance & Limits
+
+- Results cached in memory for 6 hours (max 3000 entries, ~300KB)
+- Max 5 concurrent API lookups (prevents overload)
+- 3 second timeout per lookup (fails open — allows access if API is slow)
+- Static assets (JS, CSS, images) skip IP checks entirely
+- Visitors who passed a challenge skip IP checks
+
+### Example Configurations
+
+**Public WordPress site** — challenge VPN, block Tor:
+```json
+"ip_intel": {
+  "enabled": true,
+  "block_tor": true,
+  "challenge_vpn": true,
+  "block_risk_above": 0.85
+}
+```
+
+**Admin panel** — block all anonymizers:
+```json
+"ip_intel": {
+  "enabled": true,
+  "block_vpn": true,
+  "block_tor": true,
+  "block_proxy": true,
+  "block_risk_above": 0.7
+}
+```
+
+**Relaxed** — only block highest risk:
+```json
+"ip_intel": {
+  "enabled": true,
+  "block_risk_above": 0.9,
+  "challenge_risk_above": 0.6
+}
+```
+
 ## API
 
 All admin endpoints require `?token=ADMIN_TOKEN` query parameter.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Service status, per-domain settings, memory usage, stats |
+| `/health` | GET | Service status, per-domain settings, memory, stats |
 | `/reload?token=X` | GET | Force config reload from CONFIG_URL |
 | `/attack?token=X&on=true` | GET | Enable Under Attack Mode for all domains |
 | `/attack?token=X&on=false` | GET | Disable Under Attack Mode for all domains |
 | `/attack?token=X&domain=D&on=true` | GET | Enable Under Attack Mode for specific domain |
 | `/attack?token=X&domain=D&on=false` | GET | Disable Under Attack Mode for specific domain |
+| `/ip-check?token=X&ip=1.2.3.4` | GET | Check IP intelligence data |
 
 ### Health Response Example
 
@@ -168,7 +278,11 @@ All admin endpoints require `?token=ADMIN_TOKEN` query parameter.
     "blocked": 47,
     "challenged": 12,
     "cached": 890,
-    "waf": 3
+    "waf": 3,
+    "intel_hits": 340,
+    "intel_misses": 28,
+    "intel_blocks": 5,
+    "intel_challenges": 8
   },
   "sites": [
     {
@@ -176,36 +290,51 @@ All admin endpoints require `?token=ADMIN_TOKEN` query parameter.
       "challenge": "off",
       "waf": true,
       "rateLimit": 60,
-      "attack": false
-    },
-    {
-      "domain": "admin.example.com",
-      "challenge": "all",
-      "waf": true,
-      "rateLimit": 30,
+      "ipIntel": true,
       "attack": false
     }
   ],
   "cache": 42,
   "cacheMB": "3.2",
   "rateSessions": 15,
-  "memMB": 67.3
+  "intelCache": 156,
+  "intelActive": 1,
+  "memMB": 72.4
+}
+```
+
+### IP Check Response Example
+
+```json
+{
+  "ip": "1.2.3.4",
+  "info": {
+    "vpn": true,
+    "tor": false,
+    "proxy": false,
+    "datacenter": true,
+    "risk": 0.72,
+    "country": "NL",
+    "isp": "DataCamp Limited",
+    "ts": 1708678800000
+  }
 }
 ```
 
 ## Architecture
 
 ```
-User               Render.com              Origin Server
-┌──────────┐       ┌──────────────┐        ┌──────────────┐
-│ Browser  │──────▶│ Shield Proxy │───────▶│ nginx / WP   │
-│          │◀──────│              │◀───────│              │
-└──────────┘       │ ✓ WAF        │        └──────────────┘
-                   │ ✓ Rate Limit │
-                   │ ✓ Bot Block  │
-                   │ ✓ Challenge  │
-                   │ ✓ Cache      │
-                   └──────────────┘
+User                   Render.com                    Origin Server
+┌──────────┐        ┌─────────────────┐            ┌──────────────┐
+│ Browser  │──────▶│  Shield Proxy   │──────────▶│ nginx / WP   │
+│          │◀──────│                 │◀──────────│              │
+└──────────┘        │ ✓ WAF           │            └──────────────┘
+                    │ ✓ Rate Limit    │
+                    │ ✓ Bot Block     │            ┌──────────────┐
+                    │ ✓ IP Intel ─────┼──────────▶│ ipquery.io   │
+                    │ ✓ Challenge     │◀──────────│ (IP lookup)  │
+                    │ ✓ Cache         │            └──────────────┘
+                    └─────────────────┘
 ```
 
 ## Memory Usage
@@ -217,7 +346,8 @@ Designed for Render.com free tier (512MB RAM):
 | Static cache | 15MB total, 50KB per item |
 | Large files | Streamed (>512KB), not buffered |
 | Rate limit map | Auto-cleaned every 30s, max 5000 entries |
-| Typical total | 60–120MB |
+| IP Intel cache | Max 3000 entries (~300KB), TTL 6 hours |
+| Typical total | 60–130MB |
 
 ## WAF Rules
 
@@ -232,10 +362,18 @@ The built-in WAF blocks:
 
 - **Adding a new site:** edit `sites.json` on origin, wait 5 min or call `/reload`
 - **Emergency:** call `/attack?on=true` to challenge all visitors immediately
-- **PMA / admin panels:** use `"challenge": {"mode": "all", "type": "math"}` and restrict `allowed_ips`
+- **PMA / admin panels:** use `"challenge": {"mode": "all", "type": "math"}` with `ip_intel` blocking and restricted `allowed_ips`
 - **Keep-alive:** the proxy pings itself every 14 min to prevent Render free tier sleep
 - **Multiple sites:** one Render service handles all domains, fits within 750 free hours/month
+- **IP Intelligence:** enable only for domains that need it to minimize API calls
+
+## Third-Party Services
+
+| Service | Usage | License / Terms |
+|---------|-------|-----------------|
+| [ipquery.io](https://ipquery.io) ([GitHub](https://github.com/ipqwery)) | IP intelligence — VPN, Tor, proxy detection, risk scoring | Free API, see [ipquery.io](https://ipquery.io) for terms |
+| [hCaptcha](https://www.hcaptcha.com) | Optional CAPTCHA challenge | Free tier available, see [hCaptcha terms](https://www.hcaptcha.com/terms) |
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)

@@ -14,22 +14,33 @@ const CONFIG_INTERVAL = 5 * 60_000;
 //  MEMORY LIMITS
 // ═══════════════════════════════════════════════════════════════
 
-const CACHE_MAX_BYTES = 15 * 1024 * 1024;
-const CACHE_MAX_ITEM  = 50 * 1024;
-const CACHE_TTL       = 3600_000;
+const CACHE_MAX_BYTES  = 15 * 1024 * 1024;
+const CACHE_MAX_ITEM   = 50 * 1024;
+const CACHE_TTL        = 3600_000;
 const STREAM_THRESHOLD = 512 * 1024;
-const RATE_MAP_MAX    = 5000;
+const RATE_MAP_MAX     = 5000;
 const CLEANUP_INTERVAL = 30_000;
+
+// IP Intel cache limits
+const INTEL_CACHE_MAX  = 3000;
+const INTEL_CACHE_TTL  = 6 * 3600_000;  // 6 hours
+const INTEL_TIMEOUT    = 3000;           // 3 sec timeout
+const INTEL_QUEUE_MAX  = 5;             // max concurrent lookups
 
 // ═══════════════════════════════════════════════════════════════
 //  STATE
 // ═══════════════════════════════════════════════════════════════
 
-// domain → { origin, host, sec }
 let domainMap = new Map();
 let configLoaded = false;
-// domain → attackMode
 const attackModes = new Map();
+
+const DEFAULT_INTEL = {
+    enabled: false,
+    block_vpn: false, block_tor: true, block_proxy: true,
+    challenge_vpn: true, challenge_tor: false, challenge_proxy: false,
+    block_risk_above: 0.85, challenge_risk_above: 0.5,
+};
 
 const DEFAULT_SEC = {
     blocked_ips: [], blocked_cidrs: [], allowed_ips: [], blocked_ua: [],
@@ -38,6 +49,7 @@ const DEFAULT_SEC = {
     challenge: { mode: 'off', type: 'js', duration_h: 24 },
     hcaptcha_sitekey: '', hcaptcha_secret: '',
     security_headers: true,
+    ip_intel: { ...DEFAULT_INTEL },
 };
 
 const DEFAULT_BOTS = [
@@ -46,11 +58,16 @@ const DEFAULT_BOTS = [
     'claudebot','anthropic','screaming frog',
 ];
 
-const stats = { req: 0, blocked: 0, challenged: 0, cached: 0, waf: 0 };
+const stats = { req: 0, blocked: 0, challenged: 0, cached: 0, waf: 0,
+                intel_hits: 0, intel_misses: 0, intel_blocks: 0, intel_challenges: 0 };
 const cache = new Map();
 let cacheBytes = 0;
 const rateMap = new Map();
 const agents = new Map();
+
+// IP Intelligence cache: ip → { vpn, tor, proxy, risk, ts }
+const intelCache = new Map();
+let intelActive = 0;
 
 // ═══════════════════════════════════════════════════════════════
 //  HELPERS
@@ -116,6 +133,93 @@ function isAttackMode(hostname) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  IP INTELLIGENCE (ipquery.io)
+// ═══════════════════════════════════════════════════════════════
+
+async function lookupIP(ip) {
+    // Check cache
+    const cached = intelCache.get(ip);
+    if (cached && Date.now() - cached.ts < INTEL_CACHE_TTL) {
+        stats.intel_hits++;
+        return cached;
+    }
+
+    // Skip private/local IPs
+    if (ip.startsWith('10.') || ip.startsWith('192.168.') ||
+        ip.startsWith('172.') || ip === '127.0.0.1' || ip === '0.0.0.0') {
+        return { vpn: false, tor: false, proxy: false, risk: 0, ts: Date.now() };
+    }
+
+    // Throttle concurrent requests
+    if (intelActive >= INTEL_QUEUE_MAX) {
+        return cached || null;
+    }
+
+    intelActive++;
+    stats.intel_misses++;
+
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), INTEL_TIMEOUT);
+
+        const resp = await fetch(`https://api.ipquery.io/${ip}`, {
+            signal: controller.signal,
+        });
+        clearTimeout(timeout);
+
+        if (!resp.ok) return cached || null;
+
+        const data = await resp.json();
+
+        // ipquery.io response structure:
+        // { risk: { is_vpn, is_tor, is_proxy, risk_score, ... }, ... }
+        const risk = data.risk || {};
+        const result = {
+            vpn: !!risk.is_vpn,
+            tor: !!risk.is_tor,
+            proxy: !!risk.is_proxy,
+            datacenter: !!risk.is_datacenter,
+            risk: typeof risk.risk_score === 'number' ? risk.risk_score : 0,
+            country: data.location?.country_code || '',
+            isp: data.isp?.isp || '',
+            ts: Date.now(),
+        };
+
+        // Evict old entries if cache too large
+        if (intelCache.size >= INTEL_CACHE_MAX) {
+            const oldest = intelCache.keys().next().value;
+            intelCache.delete(oldest);
+        }
+        intelCache.set(ip, result);
+
+        return result;
+    } catch {
+        return cached || null;
+    } finally {
+        intelActive--;
+    }
+}
+
+// Returns: 'block' | 'challenge' | 'pass'
+function evalIntel(info, intelCfg) {
+    if (!info) return 'pass';
+
+    // Block conditions
+    if (intelCfg.block_tor && info.tor) return 'block';
+    if (intelCfg.block_vpn && info.vpn) return 'block';
+    if (intelCfg.block_proxy && info.proxy) return 'block';
+    if (intelCfg.block_risk_above && info.risk >= intelCfg.block_risk_above) return 'block';
+
+    // Challenge conditions
+    if (intelCfg.challenge_tor && info.tor) return 'challenge';
+    if (intelCfg.challenge_vpn && info.vpn) return 'challenge';
+    if (intelCfg.challenge_proxy && info.proxy) return 'challenge';
+    if (intelCfg.challenge_risk_above && info.risk >= intelCfg.challenge_risk_above) return 'challenge';
+
+    return 'pass';
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  CACHE
 // ═══════════════════════════════════════════════════════════════
 
@@ -140,14 +244,13 @@ function cacheSet(key, data, type) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  RATE LIMITING (per domain + IP)
+//  RATE LIMITING
 // ═══════════════════════════════════════════════════════════════
 
 function rateOk(ip, sec) {
     const now = Date.now(), win = (sec.rate_limit.window_s || 60) * 1000;
-    const key = ip;
-    let e = rateMap.get(key);
-    if (!e || now - e.ts > win) { e = { c: 0, ts: now }; rateMap.set(key, e); }
+    let e = rateMap.get(ip);
+    if (!e || now - e.ts > win) { e = { c: 0, ts: now }; rateMap.set(ip, e); }
     e.c++;
     return e.c <= (sec.rate_limit.max || 100);
 }
@@ -192,11 +295,6 @@ function isBot(ua, sec) {
 
 const COOKIE_NAME = '__rv';
 
-function makeVerifyCookie(ip) {
-    const exp = Date.now() + 24 * 3600_000;
-    return `${hmac(ip + ':' + exp)}:${exp}`;
-}
-
 function makeVerifyCookieSec(ip, sec) {
     const exp = Date.now() + (sec.challenge.duration_h || 24) * 3600_000;
     return `${hmac(ip + ':' + exp)}:${exp}`;
@@ -211,16 +309,18 @@ function cookieValid(req) {
     return sig === hmac(ip + ':' + exp);
 }
 
+function isStaticPath(path) {
+    return /\.(js|css|png|jpe?g|gif|ico|svg|woff2?|ttf|eot|map|webp|avif)$/i.test(path);
+}
+
 function shouldChallenge(req, sec) {
-    if (/\.(js|css|png|jpe?g|gif|ico|svg|woff2?|ttf|eot|map|webp|avif)$/i.test(req.path)) return false;
+    if (isStaticPath(req.path)) return false;
     if (req.path.startsWith('/__')) return false;
     if (cookieValid(req)) return false;
     if (isAttackMode(req.hostname) || sec.challenge.mode === 'all') return true;
     if (sec.challenge.mode === 'suspicious') return isBot(req.get('User-Agent'), sec);
     return false;
 }
-
-// ─── Challenge Pages ───
 
 function jsChallengePage(url) {
     const a = Math.floor(Math.random() * 1000), b = Math.floor(Math.random() * 1000);
@@ -260,6 +360,14 @@ function hcaptchaPage(url, sitekey) {
 </div></body></html>`;
 }
 
+function blockedPage(reason) {
+    return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Access Denied</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh;background:#f0f2f5}.c{background:#fff;padding:48px;border-radius:12px;box-shadow:0 4px 24px rgba(0,0,0,.08);text-align:center;max-width:400px}h2{color:#d93025;margin-bottom:16px}p{color:#5f6368}</style></head>
+<body><div class="c"><h2>Access Denied</h2><p>${reason}</p></div></body></html>`;
+}
+
 function challengePage(req, sec) {
     const url = req.originalUrl;
     const type = sec.challenge.type || 'js';
@@ -288,6 +396,7 @@ function parseSecurity(raw, defaults) {
         security_headers: raw.security_headers !== undefined
             ? raw.security_headers
             : (defaults.security_headers !== undefined ? defaults.security_headers : true),
+        ip_intel: { ...DEFAULT_INTEL, ...(defaults.ip_intel || {}), ...(raw.ip_intel || {}) },
     };
 }
 
@@ -304,9 +413,7 @@ async function loadConfig() {
         for (const s of sites) {
             const o = s.origin, h = s.host || s.domains[0];
             const sec = parseSecurity(s.security, defaults);
-            for (const d of s.domains) {
-                m.set(d, { origin: o, host: h, sec });
-            }
+            for (const d of s.domains) m.set(d, { origin: o, host: h, sec });
         }
         domainMap = m;
         configLoaded = true;
@@ -325,8 +432,18 @@ setInterval(() => {
         if (now - v.ts > 120_000) rateMap.delete(k);
     }
     if (rateMap.size > RATE_MAP_MAX) rateMap.clear();
+
     for (const [k, v] of cache) {
         if (now - v.ts > CACHE_TTL) { cacheBytes -= v.data.length; cache.delete(k); }
+    }
+
+    for (const [k, v] of intelCache) {
+        if (now - v.ts > INTEL_CACHE_TTL) intelCache.delete(k);
+    }
+    if (intelCache.size > INTEL_CACHE_MAX) {
+        const half = Math.floor(INTEL_CACHE_MAX / 2);
+        const keys = [...intelCache.keys()];
+        for (let i = 0; i < keys.length - half; i++) intelCache.delete(keys[i]);
     }
 }, CLEANUP_INTERVAL);
 
@@ -396,11 +513,14 @@ app.get('/health', (req, res) => {
             challenge: e.sec.challenge.mode,
             waf: e.sec.waf,
             rateLimit: e.sec.rate_limit.max,
+            ipIntel: e.sec.ip_intel.enabled,
             attack: isAttackMode(d),
         })),
         cache: cache.size,
         cacheMB: (cacheBytes / 1048576).toFixed(1),
         rateSessions: rateMap.size,
+        intelCache: intelCache.size,
+        intelActive,
         memMB: +(process.memoryUsage.rss() / 1048576).toFixed(1),
     });
 });
@@ -415,22 +535,27 @@ app.get('/attack', (req, res) => {
     if (req.query.token !== ADMIN_TOKEN) return res.sendStatus(403);
     const domain = req.query.domain;
     const on = req.query.on !== 'false';
-
     if (domain) {
         attackModes.set(domain, on);
         return res.json({ domain, attackMode: on });
     }
-
-    // All domains
     for (const d of domainMap.keys()) attackModes.set(d, on);
     res.json({ all: true, attackMode: on });
 });
 
+// IP intel lookup endpoint (admin)
+app.get('/ip-check', async (req, res) => {
+    if (req.query.token !== ADMIN_TOKEN) return res.sendStatus(403);
+    const ip = req.query.ip || clientIP(req);
+    const info = await lookupIP(ip);
+    res.json({ ip, info });
+});
+
 // ─── Security middleware ───
-app.use((req, res, next) => {
-    // Skip internal paths
+app.use(async (req, res, next) => {
     if (req.path.startsWith('/__') || req.path === '/health'
-        || req.path === '/reload' || req.path === '/attack') {
+        || req.path === '/reload' || req.path === '/attack'
+        || req.path === '/ip-check') {
         return next();
     }
 
@@ -454,7 +579,7 @@ app.use((req, res, next) => {
     // IP blacklist
     if (sec.blocked_ips.includes(ip) || sec.blocked_cidrs.some(c => cidrMatch(ip, c))) {
         stats.blocked++;
-        return res.status(403).send('Access denied');
+        return res.status(403).send(blockedPage('Your IP address has been blocked.'));
     }
 
     // Rate limit
@@ -468,16 +593,41 @@ app.use((req, res, next) => {
     // WAF
     if (!wafOk(req, sec)) {
         stats.waf++;
-        return res.status(403).send('Blocked by WAF');
+        return res.status(403).send(blockedPage('Request blocked by firewall.'));
     }
 
-    // Bot block (if challenge mode is not suspicious — block outright)
+    // Bot block
     if (sec.challenge.mode !== 'suspicious' && isBot(req.get('User-Agent'), sec)) {
         stats.blocked++;
-        return res.status(403).send('Access denied');
+        return res.status(403).send(blockedPage('Automated access is not allowed.'));
     }
 
-    // Challenge
+    // IP Intelligence check (non-blocking for static assets)
+    if (sec.ip_intel.enabled && !isStaticPath(req.path) && !cookieValid(req)) {
+        const info = await lookupIP(ip);
+        if (info) {
+            const verdict = evalIntel(info, sec.ip_intel);
+
+            if (verdict === 'block') {
+                stats.intel_blocks++;
+                stats.blocked++;
+                let reason = 'Access denied.';
+                if (info.tor) reason = 'Tor exit nodes are not allowed.';
+                else if (info.vpn) reason = 'VPN connections are not allowed.';
+                else if (info.proxy) reason = 'Proxy connections are not allowed.';
+                else reason = 'High risk score detected.';
+                return res.status(403).send(blockedPage(reason));
+            }
+
+            if (verdict === 'challenge') {
+                stats.intel_challenges++;
+                stats.challenged++;
+                return res.status(503).send(challengePage(req, sec));
+            }
+        }
+    }
+
+    // Standard challenge
     if (shouldChallenge(req, sec)) {
         stats.challenged++;
         return res.status(503).send(challengePage(req, sec));
@@ -554,7 +704,6 @@ app.use(async (req, res) => {
         const r = await originFetch(target, req.originalUrl, opts);
         const ct = r.headers.get('content-type') || '';
 
-        // Cookies
         const cookies = r.headers.getSetCookie?.() || [];
         cookies.forEach(c => {
             res.append('Set-Cookie',
@@ -562,7 +711,6 @@ app.use(async (req, res) => {
             );
         });
 
-        // Redirects
         if ([301, 302, 303, 307, 308].includes(r.status)) {
             let loc = r.headers.get('location') || '';
             loc = loc
